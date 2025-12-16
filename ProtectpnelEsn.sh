@@ -1,155 +1,256 @@
 #!/bin/bash
-# =====================================================
-# Shaasleep Protect — Full Isolation
-# Powered by Shaasleep
-# =====================================================
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ Shaasleep Shield – Pterodactyl Hardening Kit        (c) 2025 Shaasleep ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#  :: Built for Pterodactyl 1.11.x – run as root – no warranty ::
 
 set -euo pipefail
+shopt -s expand_aliases
+alias log='echo "[$(date "+%T")] ▶"'
 
-PANEL_ROOT="/var/www/pterodactyl"
-HELPER_DIR="$PANEL_ROOT/app/Helpers"
-PHP_HELPER="$HELPER_DIR/shaasleep_protect.php"
-JS_FILE="$PANEL_ROOT/resources/js/shaasleep_donttouch.js"
+BOLD='\e[1m'
+RED='\e[31m'
+GRN='\e[32m'
+YLW='\e[33m'
+BLU='\e[34m'
+MGT='\e[35m'
+CYN='\e[36m'
+RST='\e[0m'
 
-# Backup controllers
-BACKUP_DIR="$PANEL_ROOT/backup_shaasleep_$(date +%s)"
-mkdir -p "$BACKUP_DIR"
-cp "$PANEL_ROOT"/app/Http/Controllers/*.php "$BACKUP_DIR"/ 2>/dev/null || true
-echo "✅ Backup controllers saved in $BACKUP_DIR"
+banner(){
+clear
+cat <<'EOF'
+╔═══════════════════════════════════════════════════════════════════════╗
+║    ____  _   _ ____    _____ _   _ _    _       _____ _    _ _____  ║
+║   / ___|| | | / ___|  |_   _| | | | |  | |     |  ___/ \  | |_   _| ║
+║   \___ \| | | \___ \    | | | | | | |  | |_____| |_ / _ \ | | | |   ║
+║    ___) | |_| |___) |   | | | |_| | |__| |_____|  _/ ___ \| | | |   ║
+║   |____/ \___/|____/    |_|  \___/ \____/      |_|/_/   \_\_| |_|   ║
+║                                                                       ║
+║              Pterodactyl Shield – Sleep tight, host tight.            ║
+╚═══════════════════════════════════════════════════════════════════════╝
+EOF
+}
 
-mkdir -p "$HELPER_DIR"
-cat > "$PHP_HELPER" <<'PHPHELP'
+spinner(){
+  local pid=$1; local delay=0.15; local spin='⣾⣽⣻⢿⡿⣟⣯⣷'
+  while kill -0 "$pid" 2>/dev/null; do
+    for i in $(seq 0 7); do
+      printf "${MGT}${spin:$i:1}${RST} "
+      sleep $delay
+      printf "\b\b"
+    done
+  done
+}
+
+check_root(){
+  [[ $EUID -eq 0 ]] || { log "${RED}❌  Run as root homie.${RST}"; exit 1; }
+}
+
+check_panel(){
+  [[ -d "/var/www/pterodactyl" ]] || { log "${RED}❌  Panel path not found.${RST}"; exit 1; }
+}
+
+get_admin(){
+  read -rp "$(log "${CYN}🔑 Masukkan ID Admin Utama : ${RST}")" ADMIN_ID
+  [[ "$ADMIN_ID" =~ ^[0-9]+$ ]] || { log "${RED}❌  Harus angka!${RST}"; exit 1; }
+  log "${GRN}✅  Admin utama → ID ${MGT}${ADMIN_ID}${RST}"
+}
+
+persist_env(){
+  local env="/var/www/pterodactyl/.env"
+  grep -q "^SHIELD_ADMIN_ID=" "$env" \
+    && sed -i "s/^SHIELD_ADMIN_ID=.*/SHIELD_ADMIN_ID=$ADMIN_ID/" "$env" \
+    || echo "SHIELD_ADMIN_ID=$ADMIN_ID" >> "$env"
+}
+
+patch_server_controller(){
+  local f="/var/www/pterodactyl/app/Http/Controllers/Api/Client/Server/ServerController.php"
+  grep -q "ShaasleepShield" "$f" && { log "${YLW}⚡  ServerController sudah dipatch${RST}"; return; }
+  sed -i '/public function index(/a\
+        /* ShaasleepShield */\
+        $user = auth()->user();\
+        if ($user->id != '"$ADMIN_ID"' && (int)$server->owner_id !== (int)$user->id) {\
+            abort(403, "🧊 ShaasleepShield: Akses ditolak. Server ini bukan milikmu.");\
+        }' "$f"
+  log "${GRN}✅  ServerController dipatch${RST}"
+}
+
+patch_file_controller(){
+  local f="/var/www/pterodactyl/app/Http/Controllers/Api/Client/Server/FileController.php"
+  grep -q "ShaasleepShield" "$f" && { log "${YLW}⚡  FileController sudah dipatch${RST}"; return; }
+  sed -i '/public function index(/a\
+        /* ShaasleepShield */\
+        $user = auth()->user();\
+        if ($user->id != '"$ADMIN_ID"' && (int)$server->owner_id !== (int)$user->id) {\
+            abort(403, "🧊 ShaasleepShield: Akses ditolak.");\
+        }' "$f"
+  log "${GRN}✅  FileController dipatch${RST}"
+}
+
+patch_user_controller(){
+  local f="/var/www/pterodactyl/app/Http/Controllers/Admin/UserController.php"
+  log "${CYN}🧱  Menulis UserController${RST}"
+  cat <<'PHP' > "$f"
 <?php
-use Illuminate\Support\Facades\Log;
+namespace Pterodactyl\Http\Controllers\Admin;
 
-if (!function_exists('shaasleepProtect')) {
-    function shaasleepProtect($ownerId = null, string $context = 'generic'): void
+use Illuminate\Http\RedirectResponse;
+use Pterodactyl\Http\Controllers\Controller;
+use Pterodactyl\Http\Requests\Admin\UserFormRequest;
+use Pterodactyl\Services\Users\UserUpdateService;
+use Pterodactyl\Exceptions\DisplayException;
+use Pterodactyl\Models\User;
+use Illuminate\Support\Facades\Auth;
+
+class UserController extends Controller
+{
+    public function __construct(private UserUpdateService $updateService) {}
+
+    public function update(UserFormRequest $request, User $user): RedirectResponse
     {
-        try { $authUser = Auth()->user(); } catch (\Throwable $e) { $authUser = null; }
-        $mainAdminId = (int) env('MAIN_ADMIN_ID', 1);
-
-        if ($authUser && ((int)$authUser->id === $mainAdminId || $ownerId === (int)($authUser->id ?? -1))) return;
-
-        $uid = $authUser->id ?? '-';
-        $uemail = $authUser->email ?? '-';
-        $ip = request()->ip() ?? '-';
-        $uri = request()->getRequestUri() ?? '-';
-
-        Log::warning("Shaasleep Protect BLOCK | User ID: {$uid} | Email: {$uemail} | Context: {$context} | IP: {$ip} | URI: {$uri}");
-
-        session()->push('ShaasleepAlerts', $context);
-
-        $title = 'Access Restricted';
-        $msg = match($context) {
-            'create_user' => 'Pembatasan: hubungi admin utama.',
-            'owner_view'  => 'Akses terbatas: resource ini bukan milikmu.',
-            'generic'     => 'Akses ditolak oleh Shaasleep Protect.',
-            default       => 'Akses diblokir.',
-        };
-
-        $html = <<<HTML
-<!doctype html>
-<html lang="id">
-<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{$title}</title>
-<style>
-body{margin:0;font-family:Inter,ui-sans-serif,system-ui;display:flex;align-items:center;justify-content:center;height:100vh;background:#0b0f14;color:#fff}
-.card{padding:32px;border-radius:12px;background:rgba(0,0,0,0.3);text-align:center;max-width:520px;width:90%;box-shadow:0 8px 24px rgba(0,0,0,0.7)}
-h1{margin-bottom:12px;font-size:28px;color:#ff6b6b}
-p{color:#fff;opacity:0.85;margin-bottom:16px}
-.btn{display:inline-block;margin:6px;padding:10px 16px;border-radius:10px;text-decoration:none;font-weight:600}
-.btn-primary{background:#ff6b6b;color:#fff}
-.btn-ghost{background:transparent;border:1px solid rgba(255,255,255,0.3);color:#fff}
-.small{font-size:12px;color:#9aa6b2;margin-top:12px}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>{$title}</h1>
-<p>{$msg}</p>
-<a class="btn btn-primary" href="javascript:history.back()">Kembali</a>
-<a class="btn btn-ghost" href="/">Ke Dashboard</a>
-<p class="small">Powered Protect by Shaasleep</p>
-</div>
-</body>
-</html>
-HTML;
-
-        if (function_exists('response')) {
-            response($html,403)->header('Content-Type','text/html')->send();
-        } else {
-            echo $html;
-            http_response_code(403);
+        if (Auth::user()->id != env('SHIELD_ADMIN_ID')) {
+            throw new DisplayException('🧊 ShaasleepShield: Lu siapa dongo minimal mikir kidz.');
         }
-        exit;
+        $this->updateService->handle($user, $request->normalize());
+        return redirect()->route('admin.users.view', $user->id)->with('success', 'User updated.');
     }
 }
-PHPHELP
+PHP
+  log "${GRN}✅  UserController diproteksi${RST}"
+}
 
-chmod 644 "$PHP_HELPER"
-echo "✅ PHP Helper created"
+patch_location_controller(){
+  local f="/var/www/pterodactyl/app/Http/Controllers/Admin/LocationController.php"
+  log "${CYN}🧱  Menulis LocationController${RST}"
+  cat <<'PHP' > "$f"
+<?php
+namespace Pterodactyl\Http\Controllers\Admin;
 
-# Inject helper ke semua controller
-find "$PANEL_ROOT/app/Http/Controllers" -type f -name "*.php" | while read -r controller; do
-    if grep -q "shaasleep_protect" "$controller"; then
-        echo "✔ helper already included: $controller"
-        continue
-    fi
-    awk 'NR==1 && /^<\?php/ { print; print "include app_path(\"Helpers/shaasleep_protect.php\");"; next } { print }' "$controller" > "$controller.tmp" && mv "$controller.tmp" "$controller"
-    echo "✔ helper included in: $controller"
-done
+use Illuminate\View\View;
+use Illuminate\Http\RedirectResponse;
+use Pterodactyl\Models\Location;
+use Pterodactyl\Http\Controllers\Controller;
+use Pterodactyl\Http\Requests\Admin\LocationFormRequest;
+use Pterodactyl\Services\Locations\{LocationCreationService,LocationUpdateService,LocationDeletionService};
+use Illuminate\Support\Facades\Auth;
 
-# Inject ke UserController
-USER_CTRL="$PANEL_ROOT/app/Http/Controllers/Admin/UserController.php"
-if [ -f "$USER_CTRL" ]; then
-    for method in "create" "store" "createUser" "storeUser" "postCreate"; do
-        if grep -q "public function ${method}(" "$USER_CTRL"; then
-            sed -i "/public function ${method}(/a\\
-            shaasleepProtect(null,'create_user');" "$USER_CTRL"
-            echo "✔ injected create_user protection into $method()"
-        fi
-    done
-fi
+class LocationController extends Controller
+{
+    public function __construct(
+        private LocationCreationService $creation,
+        private LocationUpdateService $update,
+        private LocationDeletionService $delete
+    ) {}
 
-# Buat JS alert
-mkdir -p "$PANEL_ROOT/resources/js"
-cat <<'EOF' > "$JS_FILE"
-document.addEventListener('DOMContentLoaded', () => {
-    if(window.ShaasleepAlerts){
-        ShaasleepAlerts.forEach(ctx => {
-            const toast = document.createElement('div');
-            toast.innerText = "⚠ ALERT! " + ctx;
-            toast.style = `
-                position:fixed;top:20px;right:-400px;
-                background:#ff2222;color:#fff;padding:14px 24px;
-                border-radius:10px;box-shadow:0 0 20px #ff0000;
-                font-family:'Segoe UI',sans-serif;
-                z-index:9999;transition: all 0.5s ease;`;
-            document.body.appendChild(toast);
-            setTimeout(() => { toast.style.right="20px"; },50);
-            setTimeout(() => { toast.style.right="-400px"; setTimeout(()=>toast.remove(),500); },3500);
-        });
+    private function shield(): void
+    {
+        if (Auth::user()->id != env('SHIELD_ADMIN_ID')) {
+            abort(403, '🧊 ShaasleepShield: Dont not your Access.');
+        }
     }
-});
+
+    public function index(): View
+    {
+        $this->shield();
+        return view('admin.locations.index', ['locations' => Location::with('nodes')->get()]);
+    }
+
+    public function create(LocationFormRequest $r): RedirectResponse
+    {
+        $this->shield();
+        $loc = $this->creation->handle($r->normalize());
+        return redirect()->route('admin.locations.view', $loc->id)->with('success', 'Location created.');
+    }
+
+    public function update(LocationFormRequest $r, Location $l): RedirectResponse
+    {
+        $this->shield();
+        $this->update->handle($l->id, $r->normalize());
+        return redirect()->route('admin.locations.view', $l->id)->with('success', 'Location updated.');
+    }
+
+    public function delete(Location $l): RedirectResponse
+    {
+        $this->shield();
+        $this->delete->handle($l->id);
+        return redirect()->route('admin.locations')->with('success', 'Location deleted.');
+    }
+}
+PHP
+  log "${GRN}✅  LocationController diproteksi${RST}"
+}
+
+inject_css(){
+  log "${CYN}🤓  Injecting custom CSS${RST}"
+  local css="/var/www/pterodactyl/resources/scripts/components/elements/ShieldBanner.tsx"
+  mkdir -p "$(dirname "$css")"
+  cat <<'TSX' > "$css"
+import React from 'react';
+import { Alert } from '@/components/elements/Alert';
+
+export default () => (
+  <Alert className="mb-5" type="info">
+    <span className="flex items-center">
+      <span className="mr-2 text-2xl">🧊</span>
+      <span>
+        <strong>Shaasleep Shield</strong> aktif – panel ini dilindungi dari intip-maling.
+      </span>
+    </span>
+  </Alert>
+);
+TSX
+
+  local dash="/var/www/pterodactyl/resources/scripts/components/dashboard/DashboardContainer.tsx"
+  grep -q "ShieldBanner" "$dash" && return
+  sed -i '/^import.*React/a import ShieldBanner from "@/components/elements/ShieldBanner";' "$dash"
+  sed -i '/<PageContentBlock>/a \          <ShieldBanner />' "$dash"
+  log "${GRN}✅  Custom protect telah dipasang${RST}"
+}
+
+build_assets(){
+  log "${CYN}🛠️   Rebuild React assets${RST}"
+  cd /var/www/pterodactyl
+  yarn install --silent
+  yarn build:production &>/dev/null &
+  spinner $!
+  log "${GRN}✅  Assets rebuilt${RST}"
+}
+
+clear_cache(){
+  log "${CYN}🧹  Clearing cache...${RST}"
+  cd /var/www/pterodactyl
+  php artisan optimize:clear &>/dev/null &
+  spinner $!
+}
+
+outro(){
+cat <<EOF
+
+${BLU}╔══════════════════════════════════════════════════════════════╗
+║                    INSTALLATION COMPLETE                     ║
+╠══════════════════════════════════════════════════════════════╣
+║  ${YLW}Tips:${BLU} Backup otomatis via cron agar aman.                  ║
+║        Semoga tidurmu nyenyak ~ Shaasleep                    ║
+╚══════════════════════════════════════════════════════════════╝${RST}
+
 EOF
+}
 
-# Inject ke dashboard
-DASHBOARD="$PANEL_ROOT/resources/views/dashboard.blade.php"
-if [ -f "$DASHBOARD" ]; then
-    if ! grep -q "Shaasleep Protect Badge" "$DASHBOARD"; then
-        sed -i "/<div class=\"dashboard-header\">/a\\
-<div id='shaasleep-badge' style='text-align:right;font-weight:bold;background:linear-gradient(90deg,#00f,#0ff);color:#fff;padding:6px 14px;border-radius:12px;box-shadow:0 0 15px #0ff,0 0 25px #00f;'>🤓 Protect by Shaasleep — Don’t Touch My Panel</div>" "$DASHBOARD"
-        sed -i "/<\/body>/i\\
-<script src=\"{{ asset('js/shaasleep_donttouch.js') }}\"></script>" "$DASHBOARD"
-        echo "✅ added to dashboard"
-    fi
-fi
+main(){
+  banner
+  check_root
+  check_panel
+  get_admin
+  persist_env
+  patch_server_controller
+  patch_file_controller
+  patch_user_controller
+  patch_location_controller
+  inject_css
+  build_assets
+  clear_cache
+  outro
+}
 
-cd "$PANEL_ROOT" || exit
-npm install --legacy-peer-deps || echo "⚠ npm install failed"
-npm run build || echo "⚠ npm build failed"
-php artisan optimize:clear
-php artisan view:clear
-php artisan cache:clear
-
-echo "✅ Shaasleep Protect activated!"
+main
